@@ -1,11 +1,16 @@
-// main.tf (Single Terraform File for ECS Deployment)
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  required_version = ">= 1.3.0"
+}
 
 provider "aws" {
   region = var.aws_region
-}
-
-data "aws_availability_zones" "available" {
-  state = "available"
 }
 
 variable "aws_region" {
@@ -13,27 +18,44 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "azs" {
+  default = ["us-east-1a", "us-east-1b"]
+}
+
 # VPC
 resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-  enable_dns_support = true
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
   enable_dns_hostnames = true
   tags = { Name = "ror-vpc" }
 }
 
-resource "aws_subnet" "public" {
+# Public Subnets (for ALB)
+resource "aws_subnet" "public_alb" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet("10.0.0.0/16", 8, 100 + count.index)
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true
+  tags = { Name = "ror-public-alb-${count.index}" }
+}
+
+# Private Subnets (for ECS, RDS)
+resource "aws_subnet" "private" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
   cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
-  map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
-  tags = { Name = "ror-public-${count.index}" }
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = false
+  tags = { Name = "ror-private-${count.index}" }
 }
 
+# Internet Gateway (for ALB)
 resource "aws_internet_gateway" "gw" {
   vpc_id = aws_vpc.main.id
 }
 
+# Public Route Table
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -43,31 +65,51 @@ resource "aws_route_table" "public" {
   }
 }
 
-resource "aws_route_table_association" "a" {
+resource "aws_route_table_association" "public_alb" {
   count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
+  subnet_id      = aws_subnet.public_alb[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
-# Use existing ECR repository
+# NAT Gateway (for private subnet internet access)
+resource "aws_eip" "nat" {}
+
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_alb[0].id
+  depends_on    = [aws_internet_gateway.gw]
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat.id
+  }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+# S3 Bucket
+resource "aws_s3_bucket" "app" {
+  bucket        = "ror-app-bucket-fixed"
+  force_destroy = true
+}
+
+# ECR
 data "aws_ecr_repository" "app" {
   name = "ror-app-repo"
 }
 
-# S3 Bucket
-resource "random_id" "bucket_id" {
-  byte_length = 4
-}
-
-resource "aws_s3_bucket" "app" {
-  bucket        = "ror-app-bucket-${random_id.bucket_id.hex}"
-  force_destroy = true
-}
-
-# RDS Subnet Group
+# RDS (Private Subnets)
 resource "aws_db_subnet_group" "default" {
   name       = "ror-db-subnet-group"
-  subnet_ids = aws_subnet.public[*].id
+  subnet_ids = aws_subnet.private[*].id
 }
 
 resource "aws_db_instance" "postgres" {
@@ -144,11 +186,7 @@ resource "aws_security_group" "rds" {
   }
 }
 
-# ECS
-resource "aws_ecs_cluster" "main" {
-  name = "ror-cluster"
-}
-
+# IAM Role
 resource "aws_iam_role" "ecs_exec" {
   name = "ecs-exec-role"
   assume_role_policy = jsonencode({
@@ -182,6 +220,12 @@ resource "aws_iam_role_policy" "s3_policy" {
   })
 }
 
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "ror-cluster"
+}
+
+# ECS Task Definition
 resource "aws_ecs_task_definition" "app" {
   family                   = "ror-task"
   requires_compatibilities = ["FARGATE"]
@@ -190,42 +234,40 @@ resource "aws_ecs_task_definition" "app" {
   memory                   = "1024"
   execution_role_arn       = aws_iam_role.ecs_exec.arn
 
-  container_definitions = jsonencode([
-    {
-      name      = "ror-container",
-      image = "${data.aws_ecr_repository.app.repository_url}:latest"
-      essential = true,
-      portMappings = [
-        { containerPort = 3000 }
-      ],
-      environment = [
-        { name = "RDS_DB_NAME",     value = aws_db_instance.postgres.db_name },
-        { name = "RDS_USERNAME",    value = aws_db_instance.postgres.username },
-        { name = "RDS_PASSWORD",    value = "securepassword" }, # Not accessible via attribute
-        { name = "RDS_HOSTNAME",    value = aws_db_instance.postgres.address },
-        { name = "RDS_PORT",        value = tostring(aws_db_instance.postgres.port) },
-        { name = "S3_BUCKET_NAME",  value = aws_s3_bucket.app.bucket },
-        { name = "S3_REGION_NAME",  value = var.aws_region },
-        { name = "LB_ENDPOINT",     value = aws_lb.app.dns_name }
-      ]
-    }
-  ])
+  container_definitions = jsonencode([{
+    name      = "ror-container",
+    image     = "${data.aws_ecr_repository.app.repository_url}:v1.0.0",
+    essential = true,
+    portMappings = [{
+      containerPort = 3000
+    }],
+    environment = [
+      { name = "RDS_DB_NAME",     value = aws_db_instance.postgres.db_name },
+      { name = "RDS_USERNAME",    value = aws_db_instance.postgres.username },
+      { name = "RDS_PASSWORD",    value = "securepassword" },
+      { name = "RDS_HOSTNAME",    value = aws_db_instance.postgres.address },
+      { name = "RDS_PORT",        value = tostring(aws_db_instance.postgres.port) },
+      { name = "S3_BUCKET_NAME",  value = aws_s3_bucket.app.bucket },
+      { name = "S3_REGION_NAME",  value = var.aws_region },
+      { name = "LB_ENDPOINT",     value = aws_lb.app.dns_name }
+    ]
+  }])
 }
 
-
+# Load Balancer
 resource "aws_lb" "app" {
   name               = "ror-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  subnets            = aws_subnet.public_alb[*].id
 }
 
 resource "aws_lb_target_group" "app" {
-  name     = "ror-tg"
-  port     = 3000
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
+  name        = "ror-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
   target_type = "ip"
   health_check {
     path                = "/"
@@ -241,13 +283,13 @@ resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.app.arn
   port              = 80
   protocol          = "HTTP"
-
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app.arn
   }
 }
 
+# ECS Service
 resource "aws_ecs_service" "app" {
   name            = "ror-service"
   cluster         = aws_ecs_cluster.main.id
@@ -255,9 +297,9 @@ resource "aws_ecs_service" "app" {
   desired_count   = 1
   launch_type     = "FARGATE"
   network_configuration {
-    subnets         = aws_subnet.public[*].id
+    subnets         = aws_subnet.private[*].id
     security_groups = [aws_security_group.ecs.id]
-    assign_public_ip = true
+    assign_public_ip = false
   }
   load_balancer {
     target_group_arn = aws_lb_target_group.app.arn
@@ -267,6 +309,7 @@ resource "aws_ecs_service" "app" {
   depends_on = [aws_lb_listener.http]
 }
 
+# Output
 output "load_balancer_dns" {
   description = "DNS of the Application Load Balancer"
   value       = aws_lb.app.dns_name
