@@ -27,7 +27,7 @@ resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags = { Name = "ror-vpc" }
+  tags = { Name = "rorrss-vpc" }
 }
 
 # Public Subnets (for ALB)
@@ -37,7 +37,7 @@ resource "aws_subnet" "public_alb" {
   cidr_block              = cidrsubnet("10.0.0.0/16", 8, 100 + count.index)
   availability_zone       = var.azs[count.index]
   map_public_ip_on_launch = true
-  tags = { Name = "ror-public-alb-${count.index}" }
+  tags = { Name = "rorrss-public-alb-${count.index}" }
 }
 
 # Private Subnets (for ECS, RDS)
@@ -47,7 +47,7 @@ resource "aws_subnet" "private" {
   cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
   availability_zone       = var.azs[count.index]
   map_public_ip_on_launch = false
-  tags = { Name = "ror-private-${count.index}" }
+  tags = { Name = "rorrss-private-${count.index}" }
 }
 
 # Internet Gateway (for ALB)
@@ -97,29 +97,29 @@ resource "aws_route_table_association" "private" {
 
 # S3 Bucket
 resource "aws_s3_bucket" "app" {
-  bucket        = "ror-app-bucket-fixed"
+  bucket        = "rorrss-app-bucket-fixed"
   force_destroy = true
 }
 
 # ECR
 data "aws_ecr_repository" "app" {
-  name = "ror-app-repo"
+  name = "rorrss-app-repo"
 }
 
 # RDS (Private Subnets)
 resource "aws_db_subnet_group" "default" {
-  name       = "ror-db-subnet-group"
+  name       = "rorrss-db-subnet-group"
   subnet_ids = aws_subnet.private[*].id
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier              = "ror-db"
+  identifier              = "rorrss-db"
   engine                  = "postgres"
   engine_version          = "13.15"
   instance_class          = "db.t3.micro"
   allocated_storage       = 20
-  db_name                 = "rorappdb"
-  username                = "roruser"
+  db_name                 = "rorrssappdb"
+  username                = "rorrssuser"
   password                = "securepassword"
   skip_final_snapshot     = true
   publicly_accessible     = false
@@ -222,12 +222,12 @@ resource "aws_iam_role_policy" "s3_policy" {
 
 # ECS Cluster
 resource "aws_ecs_cluster" "main" {
-  name = "ror-cluster"
+  name = "rorrss-cluster"
 }
 
 # ECS Task Definition
 resource "aws_ecs_task_definition" "app" {
-  family                   = "ror-task"
+  family                   = "rorrss-task"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = "512"
@@ -235,7 +235,7 @@ resource "aws_ecs_task_definition" "app" {
   execution_role_arn       = aws_iam_role.ecs_exec.arn
 
   container_definitions = jsonencode([{
-    name      = "ror-container",
+    name      = "rorrss-container",
     image     = "${data.aws_ecr_repository.app.repository_url}:v1.0.0",
     essential = true,
     portMappings = [{
@@ -256,7 +256,7 @@ resource "aws_ecs_task_definition" "app" {
 
 # Load Balancer
 resource "aws_lb" "app" {
-  name               = "ror-lb"
+  name               = "rorrss-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
@@ -264,7 +264,7 @@ resource "aws_lb" "app" {
 }
 
 resource "aws_lb_target_group" "app" {
-  name        = "ror-tg"
+  name        = "rorrss-tg"
   port        = 3000
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
@@ -291,7 +291,7 @@ resource "aws_lb_listener" "http" {
 
 # ECS Service
 resource "aws_ecs_service" "app" {
-  name            = "ror-service"
+  name            = "rorrss-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = 1
@@ -303,7 +303,7 @@ resource "aws_ecs_service" "app" {
   }
   load_balancer {
     target_group_arn = aws_lb_target_group.app.arn
-    container_name   = "ror-container"
+    container_name   = "rorrss-container"
     container_port   = 3000
   }
   depends_on = [aws_lb_listener.http]
